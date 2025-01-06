@@ -1,0 +1,94 @@
+# Step 1: Install the required libraries
+# Run this command in your terminal or command prompt
+# pip install transformers torch pandas requests
+
+import requests
+import pandas as pd
+from transformers import BartTokenizer, BartForConditionalGeneration, Trainer, TrainingArguments, pipeline
+import torch
+
+# Step 2: Set up AssemblyAI API Key and endpoints
+ASSEMBLYAI_API_KEY = 'YOUR_ASSEMBLYAI_API_KEY'  # Replace with your API key
+UPLOAD_ENDPOINT = "https://api.assemblyai.com/v2/upload"
+TRANSCRIPTION_ENDPOINT = "https://api.assemblyai.com/v2/transcript"
+
+# Step 3: Function to transcribe audio using AssemblyAI
+def transcribe_audio(file_path):
+    # Upload audio file
+    with open(file_path, 'rb') as f:
+        upload_response = requests.post(UPLOAD_ENDPOINT, headers={'authorization': ASSEMBLYAI_API_KEY}, files={'file': f})
+    audio_url = upload_response.json()['upload_url']
+
+    # Request transcription
+    transcript_request = {'audio_url': audio_url}
+    transcript_response = requests.post(TRANSCRIPTION_ENDPOINT, json=transcript_request, headers={'authorization': ASSEMBLYAI_API_KEY})
+    transcript_id = transcript_response.json()['id']
+
+    # Polling for completion
+    while True:
+        polling_response = requests.get(f"{TRANSCRIPTION_ENDPOINT}/{transcript_id}", headers={'authorization': ASSEMBLYAI_API_KEY})
+        if polling_response.json()['status'] == 'completed':
+            return polling_response.json()['text']
+        elif polling_response.json()['status'] == 'failed':
+            raise Exception("Transcription failed.")
+
+# Step 4: Load your dataset (ensure you replace 'your_dataset.csv' with your actual dataset path)
+df = pd.read_csv('your_dataset.csv')  # Your dataset should have 'input_text' and 'target_summary' columns
+train_texts = df['input_text'].tolist()
+train_labels = df['target_summary'].tolist()
+
+# Step 5: Initialize tokenizer and model for BART
+tokenizer = BartTokenizer.from_pretrained('facebook/bart-large-cnn')
+model = BartForConditionalGeneration.from_pretrained('facebook/bart-large-cnn')
+
+# Step 6: Tokenize the data
+train_encodings = tokenizer(train_texts, truncation=True, padding=True)
+train_labels_encodings = tokenizer(train_labels, truncation=True, padding=True)
+
+# Step 7: Create a dataset class
+class SummarizationDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels = labels
+
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item['labels'] = torch.tensor(self.labels['input_ids'][idx])
+        return item
+
+    def __len__(self):
+        return len(self.encodings['input_ids'])
+
+train_dataset = SummarizationDataset(train_encodings, train_labels_encodings)
+
+# Step 8: Set training arguments
+training_args = TrainingArguments(
+    output_dir='./results',
+    num_train_epochs=3,
+    per_device_train_batch_size=4,
+    save_steps=10_000,
+    save_total_limit=2,
+    logging_dir='./logs',
+    logging_steps=500,
+)
+
+# Step 9: Train the model
+trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset)
+trainer.train()
+
+# Step 10: Save the fine-tuned model (optional)
+model.save_pretrained('./fine_tuned_bart')
+tokenizer.save_pretrained('./fine_tuned_bart')
+
+# Step 11: Load the fine-tuned model for summarization
+summarize_mdl = pipeline("summarization", model='./fine_tuned_bart', tokenizer='./fine_tuned_bart')
+
+# Step 12: Transcribe audio and summarize new text
+audio_file_path = "path/to/your/audio/file.wav"  # Replace with your audio file path
+transcribed_text = transcribe_audio(audio_file_path)
+
+# Step 13: Summarize the transcribed text
+summarized_txt = summarize_mdl(transcribed_text, max_length=130, min_length=30, do_sample=False)
+
+# Step 14: Print the summary
+print("Summary:", summarized_txt[0]['summary_text'])
